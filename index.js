@@ -12,8 +12,7 @@
  */
 
 import { randomBytes, randomUUID, timingSafeEqual } from 'node:crypto'
-import { readFileSync, rmSync } from 'node:fs'
-import { mkdir, writeFile } from 'node:fs/promises'
+import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from 'node:fs'
 import { homedir } from 'node:os'
 import { dirname, join, resolve } from 'node:path'
 
@@ -92,6 +91,7 @@ function tokensMatch(presented, expected) {
  * @param config - row configuration from `cordis.patch.yml`; every field is optional.
  */
 export function apply(ctx, config = {}) {
+  let disposed = false
   const logger = ctx.logger?.('dsh-mcp-server') ?? { info() {}, warn() {}, debug() {}, error() {} }
   const log = (level, message, detail) => {
     const sink = typeof logger[level] === 'function' ? logger[level].bind(logger) : logger.info?.bind(logger)
@@ -105,6 +105,17 @@ export function apply(ctx, config = {}) {
     : join(dshHome, 'mcp', 'dsh-mcp-endpoint.json')
   const writeEndpointFile = config.writeEndpointFile !== false
   const allowConnectionAuth = config.allowConnectionAuth !== false
+  const loopbackOnly = config.loopbackOnly === true
+  const requireConfigAuth = config.requireConfigAuth === true
+  const profileContext = ctx.get('profileContext')
+  let runtimeVersion
+  try {
+    const anchor = profileContext?.installAnchor
+    const manifest = anchor && JSON.parse(readFileSync(anchor, 'utf8'))
+    if (manifest?.name === '@deepseek-ai/dsh') runtimeVersion = manifest.version
+  } catch {
+    // Never substitute the plugin's version for an unknown Host version.
+  }
   const turnTimeoutMs = Number.isFinite(Number(config.turnTimeoutMs)) ? Number(config.turnTimeoutMs) : DEFAULT_TURN_TIMEOUT_MS
   const maxConcurrentTurns = Number.isFinite(Number(config.maxConcurrentTurns))
     ? Math.max(1, Number(config.maxConcurrentTurns))
@@ -250,7 +261,13 @@ export function apply(ctx, config = {}) {
     }
     try {
       const selection = ctx.get('agentDefaultModel')?.currentSelection?.()
-      if (selection?.provider && selection?.model) return { provider: selection.provider, model: selection.model }
+      if (selection?.provider && selection?.model) {
+        return {
+          provider: selection.provider,
+          model: selection.model,
+          ...(typeof selection.reasoningEffort === 'string' ? { reasoningEffort: selection.reasoningEffort } : {}),
+        }
+      }
     } catch (error) {
       log('debug', 'default model lookup failed', { error: error instanceof Error ? error.message : String(error) })
     }
@@ -284,7 +301,9 @@ export function apply(ctx, config = {}) {
     defaultCwd: typeof config.defaultCwd === 'string' && config.defaultCwd ? resolve(config.defaultCwd) : undefined,
     turnTimeoutMs,
     maxConcurrentTurns,
-    dshVersion: VERSION,
+    dshVersion: runtimeVersion,
+    profile: profileContext?.name,
+    maxPermissionPreset: config.maxPermissionPreset,
     dshHome,
     endpoint: endpointUrl,
     startedAt,
@@ -371,6 +390,7 @@ export function apply(ctx, config = {}) {
 
   /** Authorize one inbound request: bearer token first, then Harness connection trust. */
   function authorize(req, url) {
+    if (loopbackOnly && !isLocalSocket(req)) return { ok: false, status: 403, message: 'Loopback only.\n' }
     const presented = readPresentedToken(req, url)
     if (tokensMatch(presented, token)) return { ok: true, peer: 'token' }
     if (allowConnectionAuth && connection) {
@@ -388,6 +408,21 @@ export function apply(ctx, config = {}) {
         ? 'Unauthorized: send "Authorization: Bearer <token>" using the token in the endpoint file.\n'
         : 'Unauthorized: the bearer token does not match this endpoint.\n',
     }
+  }
+
+  function isLocalSocket(req) {
+    const address = req.socket?.remoteAddress
+    return address === '::1' || /^127\./.test(address ?? '') || /^::ffff:127\./.test(address ?? '')
+  }
+
+  function authorizeConfig(req, url) {
+    if (!isLocalSocket(req)) return { ok: false, status: 403 }
+    if (tokensMatch(readPresentedToken(req, url), token)) return { ok: true }
+    try {
+      const carrier = ctx.get('connection')
+      if (carrier && carrier.requestRejection({ headers: req.headers }) === undefined) return { ok: true }
+    } catch { /* A missing or disposed browser authenticator fails closed. */ }
+    return { ok: false, status: 401 }
   }
 
   const handler = createMcpHttpHandler({
@@ -560,6 +595,7 @@ export function apply(ctx, config = {}) {
         remove: removeDshGroups,
         queueSession: queueOpenSession,
         ackCommand: async () => { guiCommand = undefined },
+        authorize: requireConfigAuth ? authorizeConfig : undefined,
         logger: log,
       }),
     })
@@ -567,7 +603,7 @@ export function apply(ctx, config = {}) {
 
   /** Publish connection details so stdio bridges and humans can find the endpoint. */
   async function publishEndpoint() {
-    if (!writeEndpointFile) return
+    if (!writeEndpointFile || disposed) return
     const url = `${resolveBaseUrl()}${path}`
     const payload = {
       url,
@@ -578,14 +614,20 @@ export function apply(ctx, config = {}) {
       serverName: SERVER_NAME,
       instanceId,
       startedAt: new Date(startedAt).toISOString(),
-      profile: process.env.DSH_PROFILE,
+      profile: profileContext?.name ?? process.env.DSH_PROFILE,
       stdioBridge: join(import.meta.dirname, 'bin', 'dsh-mcp-stdio.mjs'),
       tools: capabilities.tools.map((tool) => tool.name),
       updatedAt: new Date().toISOString(),
     }
     try {
-      await mkdir(dirname(endpointFile), { recursive: true, mode: 0o700 })
-      await writeFile(endpointFile, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600 })
+      mkdirSync(dirname(endpointFile), { recursive: true, mode: 0o700 })
+      const temporary = `${endpointFile}.${instanceId}.tmp`
+      try {
+        writeFileSync(temporary, JSON.stringify(payload, null, 2) + '\n', { mode: 0o600, flag: 'wx' })
+        renameSync(temporary, endpointFile)
+      } finally {
+        rmSync(temporary, { force: true })
+      }
       log('info', 'endpoint published', { url, endpointFile })
     } catch (error) {
       log('warn', 'could not publish endpoint file', {
@@ -631,6 +673,7 @@ export function apply(ctx, config = {}) {
       }
     }, 100)
     timer.unref?.()
+    ctx.effect(() => () => clearInterval(timer), 'dsh-mcp-server: stop endpoint polling')
   }
 
   republishWhenListening()
@@ -646,6 +689,7 @@ export function apply(ctx, config = {}) {
   function repairGrouping() {
     if (!groupSessions) return
     const run = () => {
+      if (disposed) return
       void groupOwnedSessions(ctx, clients, { create: createGroups, logger: log })
         .then((result) => {
           if (result && (result.attached > 0 || result.created > 0)) {
@@ -660,6 +704,7 @@ export function apply(ctx, config = {}) {
     // migration and must not compete with the readiness work the listener needs.
     const timer = setTimeout(run, 5000)
     timer.unref?.()
+    ctx.effect(() => () => clearTimeout(timer), 'dsh-mcp-server: stop grouping repair')
   }
 
   repairGrouping()
@@ -691,6 +736,7 @@ export function apply(ctx, config = {}) {
   }
 
   ctx.effect(() => () => {
+    disposed = true
     try {
       disposeRoute()
     } catch (error) {

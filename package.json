@@ -1,6 +1,6 @@
 {
   "name": "@local/dsh-mcp-server",
-  "version": "0.11.2",
+  "version": "0.11.4-desktop-output.1",
   "type": "module",
   "description": "Expose DeepSeek Harness sessions, agents, and tools to any other agent harness over the Model Context Protocol.",
   "license": "MIT",
@@ -37,7 +37,11 @@
     "dsh-mcp-stdio": "./bin/dsh-mcp-stdio.mjs"
   },
   "scripts": {
-    "test": "node test/mcp-self-test.mjs && node test/plugin-integration-test.mjs && node test/client-half-test.mjs"
+    "test": "node test/mcp-self-test.mjs && node test/plugin-integration-test.mjs && node test/client-half-test.mjs",
+    "test:compat": "node test/compat/follow-regression.mjs && node test/compat/bridge-regression.mjs && node test/compat/host-security-regression.mjs",
+    "test:desktop-status": "node test/compat/desktop-status-probe.mjs",
+    "test:events": "node test/compat/events-regression.mjs",
+    "test:job-output": "node test/compat/job-output-regression.mjs"
   },
   "files": [
     "index.js",

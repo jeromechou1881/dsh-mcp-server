@@ -1,3 +1,23 @@
 node_modules/
 *.log
 .DS_Store
+
+# Local runtime state and audit artifacts must never enter the fork.
+.env
+.env.*
+!.env.example
+.dsh/
+.codex/
+.tmp/
+artifacts/
+backups/
+logs/
+sessions/
+test-project/
+*.jsonl
+*.jsonl.zstd
+*endpoint*.json
+*login-url*
+*.pem
+*.key
+*.p12

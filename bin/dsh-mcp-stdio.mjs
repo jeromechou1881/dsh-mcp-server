@@ -60,11 +60,23 @@ function resolveEndpoint() {
     }
     return fileValue
   }
-  const fromEnv = process.env.DSH_MCP_URL
-  const envToken = process.env.DSH_MCP_TOKEN
-  const file = fromEnv && envToken ? undefined : readFile()
-  const url = args.url ?? fromEnv ?? file?.url
-  const token = args.token ?? envToken ?? file?.token
+  const cli = args.url !== undefined || args.token !== undefined
+  const env = process.env.DSH_MCP_URL !== undefined || process.env.DSH_MCP_TOKEN !== undefined
+  const source = cli ? args : env ? { url: process.env.DSH_MCP_URL, token: process.env.DSH_MCP_TOKEN } : readFile()
+  // A Desktop-bound global registration must never fall through to a Web Host
+  // or to inherited URL/token overrides that carry no verified profile metadata.
+  if (args['expected-profile'] && source?.profile !== args['expected-profile']) return {}
+  // URL and token must come from one complete source, never separate fallbacks.
+  const url = source?.url
+  const token = source?.token
+  if (url) {
+    let parsed
+    try { parsed = new URL(url) } catch { return {} }
+    if (!['127.0.0.1', '[::1]', 'localhost'].includes(parsed.hostname)
+      || !['http:', 'https:'].includes(parsed.protocol) || parsed.username || parsed.password || parsed.search || parsed.hash) {
+      return {}
+    }
+  }
   return { url, token }
 }
 
@@ -129,10 +141,9 @@ function unreachableError(id, detail) {
 async function forward(message) {
   const id = message?.id
   const isRequest = id !== undefined && id !== null
+  // Reload the discovery file for every request: Host restarts rotate the token.
+  endpoint = resolveEndpoint()
   if (!endpoint.url || !endpoint.token) {
-    endpoint = resolveEndpoint()
-  }
-  if (!endpoint.url) {
     log(`no endpoint; expected ${endpointFile} or DSH_MCP_URL`)
     if (isRequest) writeMessage(unreachableError(id, 'no endpoint is configured'))
     return
@@ -144,6 +155,7 @@ async function forward(message) {
   try {
     const response = await fetch(endpoint.url, {
       method: 'POST',
+      redirect: 'error',
       headers: {
         'content-type': 'application/json',
         accept: 'application/json, text/event-stream',
